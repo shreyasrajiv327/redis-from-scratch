@@ -1,107 +1,135 @@
-#include <iostream>
-#include <string>
-#include <vector>
-#include <stdexcept>
-#include <cstring>
-#include <cassert>
-#include <cerrno>
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <string>
+#include <vector>
 
-constexpr size_t kMaxMsg = 4096;
+static void msg(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
+}
 
-void die(const std::string &msg)
-{
+static void die(const char *msg) {
     int err = errno;
-    std::cerr<<"[" << err << "]" << std::endl;
-    throw std::runtime_error(msg);
+    fprintf(stderr, "[%d] %s\n", err, msg);
+    abort();
 }
 
-int read_full(int fd, char *buf, size_t n)
-{
-   while(n>0)
-   {
-     ssize_t rv = read(fd, buf, n);
-     if(rv<=0) return -1;
-      n -= static_cast<size_t>(rv);
-      buf += rv;
-   }
-   return 0;
-}
-
-int write_all(int fd, const char *buf, size_t n)
-{
-    while(n>0)
-    {
-        ssize_t rv = write(fd, buf, n);
-        if(rv<=0) return -1;
-        n -= static_cast<size_t>(rv);
+static int32_t read_full(int fd, uint8_t *buf, size_t n) {
+    while (n > 0) {
+        ssize_t rv = read(fd, buf, n);
+        if (rv <= 0) {
+            return -1;  // error or EOF
+        }
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
         buf += rv;
     }
     return 0;
 }
 
-int query (int fd, const std::string &text)
-{
-    uint32_t len = static_cast<uint32_t>(text.size());
-    if(len>kMaxMsg)
-    {
-        throw std::runtime_error("message too long");
+static int32_t write_all(int fd, const uint8_t *buf, size_t n) {
+    while (n > 0) {
+        ssize_t rv = write(fd, buf, n);
+        if (rv <= 0) {
+            return -1;  // error
+        }
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
+        buf += rv;
+    }
+    return 0;
+}
+
+static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len) {
+    buf.insert(buf.end(), data, data + len);
+}
+
+const size_t k_max_msg = 32 << 20;  // 32 MB max message
+
+// --- Send request: prefix with 4-byte length ---
+static int32_t send_req(int fd, const uint8_t *text, size_t len) {
+    if (len > k_max_msg) return -1;
+
+    std::vector<uint8_t> wbuf;
+    buf_append(wbuf, (const uint8_t *)&len, 4);  // little-endian
+    buf_append(wbuf, text, len);
+    return write_all(fd, wbuf.data(), wbuf.size());
+}
+
+// --- Read response ---
+static int32_t read_res(int fd) {
+    std::vector<uint8_t> rbuf(4);
+    errno = 0;
+
+    int32_t err = read_full(fd, &rbuf[0], 4);
+    if (err) {
+        if (errno == 0)
+            msg("EOF");
+        else
+            msg("read() error");
+        return err;
     }
 
-    std::vector<char> wbuf(4+len);
-    std::memcpy(wbuf.data(),&len,4);
-    std::memcpy(wbuf.data()+4,text.data(),len);
-
-    if(write_all(fd, wbuf.data(), wbuf.size())<0){
-        die("write_all() failed");
+    uint32_t len = 0;
+    memcpy(&len, rbuf.data(), 4);
+    if (len > k_max_msg) {
+        msg("too long");
+        return -1;
     }
 
-    std::vector<char> rbuf(4+kMaxMsg);
-    if(read_full(fd, rbuf.data(),4)<0)
-    {
-         die("read_full(header) failed");
+    rbuf.resize(4 + len);
+    err = read_full(fd, &rbuf[4], len);
+    if (err) {
+        msg("read() error");
+        return err;
     }
 
-    std::memcpy(&len, rbuf.data(), 4);
-    if (len > kMaxMsg)
-        throw std::runtime_error("server response too long");
-
-    // Read body
-    if (read_full(fd, rbuf.data() + 4, len) < 0)
-        die("read_full(body) failed");
-
-    std::string reply(rbuf.data() + 4, len);
-    std::cout << "Server says: " << reply << std::endl;
+    printf("len:%u data:%.*s\n", len, len < 100 ? len : 100, &rbuf[4]);
     return 0;
 }
 
 int main() {
-    try {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0)
-            die("socket() failed");
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        die("socket()");
 
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(1234);
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(1234);                    // ✅ FIXED
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // ✅ FIXED (127.0.0.1)
 
-        if (connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0)
-            die("connect() failed");
+    int rv = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
+    if (rv)
+        die("connect");
 
-        // Multiple requests
-        query(fd, "hello1");
-        query(fd, "hello2");
-        query(fd, "hello3");
+    std::vector<std::string> query_list = {
+        "hello1",
+        "hello2",
+        "hello3",
+        std::string(1024, 'z'),  // 1 KB test message instead of 32 MB for quick test
+        "hello5",
+    };
 
-        close(fd);
-    } catch (const std::exception &e) {
-        std::cerr << "Fatal error: " << e.what() << std::endl;
-        return 1;
+    for (const std::string &s : query_list) {
+        int32_t err = send_req(fd, (uint8_t *)s.data(), s.size());
+        if (err)
+            goto L_DONE;
     }
 
+    for (size_t i = 0; i < query_list.size(); ++i) {
+        int32_t err = read_res(fd);
+        if (err)
+            goto L_DONE;
+    }
+
+L_DONE:
+    close(fd);
     return 0;
 }
